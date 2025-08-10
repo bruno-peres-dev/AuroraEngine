@@ -1,0 +1,49 @@
+# C/C++/Toolchains
+*.obj
+*.o
+*.pch
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.log
+
+# CMake
+/build/
+/build-*/
+/out/
+/bin/
+/lib/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+/*.sln
+/*.vcxproj
+/*.vcxproj.filters
+
+# Visual Studio
+/.vs/
+/x64/
+/x86/
+/Debug/
+/Release/
+/ipch/
+*.opendb
+*.VC.db
+*.VC.opendb
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Other tooling/artifacts
+/.cursor/
+/.lmstudio/
+/.nuget/
+
