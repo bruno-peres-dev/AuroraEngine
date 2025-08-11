@@ -14,6 +14,7 @@ struct WGLContext {
     bool initialize(HWND targetWindow, bool vsync);
     void swapBuffers();
     void shutdown();
+    void setVsync(bool enabled);
 };
 
 }

@@ -1,6 +1,7 @@
 #include "WGLContext.hpp"
 #include "Aurora/Core/Log.hpp"
 #include <glad/glad.h>
+#include "GLState.hpp"
 #ifdef _WIN32
 
 // Minimal constant definitions for KHR_debug and GL core enums not in gl.h
@@ -16,6 +17,7 @@
 
 typedef HGLRC (APIENTRYP PFNWGLCREATECONTEXTATTRIBSARBPROC)(HDC, HGLRC, const int*);
 typedef BOOL (APIENTRYP PFNWGLSWAPINTERVALEXTPROC)(int);
+static PFNWGLSWAPINTERVALEXTPROC s_wglSwapIntervalEXT = nullptr;
 
 namespace Aurora::RHI {
 
@@ -76,6 +78,9 @@ bool WGLContext::initialize(HWND targetWindow, bool vsync) {
     if (!gladLoadGL()) { Core::log(Core::LogLevel::Error, "gladLoadGL falhou"); return false; }
     // Query extensions for 420 pack
 
+    // Reset cache de estado por segurança após criação de contexto
+    GLState::resetCache();
+
     // Setup debug callback if available
     if (glDebugMessageCallback) {
         glEnable(GL_DEBUG_OUTPUT);
@@ -83,9 +88,9 @@ bool WGLContext::initialize(HWND targetWindow, bool vsync) {
     }
 
     // VSync
-    auto wglSwapIntervalEXT = reinterpret_cast<PFNWGLSWAPINTERVALEXTPROC>(wglGetProcAddress("wglSwapIntervalEXT"));
-    if (wglSwapIntervalEXT) {
-        wglSwapIntervalEXT(vsync ? 1 : 0);
+    s_wglSwapIntervalEXT = reinterpret_cast<PFNWGLSWAPINTERVALEXTPROC>(wglGetProcAddress("wglSwapIntervalEXT"));
+    if (s_wglSwapIntervalEXT) {
+        s_wglSwapIntervalEXT(vsync ? 1 : 0);
     }
 
     return true;
@@ -104,6 +109,12 @@ void WGLContext::shutdown() {
     if (hdc && hwnd) {
         ReleaseDC(hwnd, hdc);
         hdc = nullptr;
+    }
+}
+
+void WGLContext::setVsync(bool enabled) {
+    if (s_wglSwapIntervalEXT) {
+        s_wglSwapIntervalEXT(enabled ? 1 : 0);
     }
 }
 

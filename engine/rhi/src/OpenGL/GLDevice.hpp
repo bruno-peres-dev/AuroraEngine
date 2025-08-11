@@ -1,34 +1,21 @@
 #pragma once
 
 #include "Aurora/RHI/RHI.hpp"
+#include <unordered_map>
+#include <string>
+#include <vector>
+#include <functional>
 
-#ifdef _WIN32
-#  include "WGLContext.hpp"
-#endif
+#include "GLRenderPass.hpp"
+#include "GLSwapchain.hpp"
+#include "GLShaderModule.hpp"
+#include "GLBuffer.hpp"
+#include "GLGraphicsPipeline.hpp"
+#include "GLDescriptorSet.hpp"
+#include "GLTexture.hpp"
+#include "GLSampler.hpp"
 
 namespace Aurora::RHI {
-
-class GLRenderPass final : public IRenderPass {
-public:
-    explicit GLRenderPass(const RenderPassDesc& desc) : desc_(desc) {}
-    RenderPassDesc desc_{};
-};
-
-class GLSwapchain final : public ISwapchain {
-public:
-    explicit GLSwapchain(uint32_t w, uint32_t h) : width_(w), height_(h) {}
-    void present() override;
-    void resize(uint32_t width, uint32_t height) override { width_ = width; height_ = height; }
-    uint32_t getWidth() const override { return width_; }
-    uint32_t getHeight() const override { return height_; }
-
-#ifdef _WIN32
-    WGLContext context_{};
-#endif
-private:
-    uint32_t width_{0};
-    uint32_t height_{0};
-};
 
 class GLDevice final : public IDevice {
 public:
@@ -43,42 +30,7 @@ public:
     void endRenderPass() override;
 
 private:
-    // RHI resource implementations
-    class GLShaderModule final : public IShaderModule {
-    public:
-        GLShaderModule(ShaderStage stage, unsigned int id) : stage_(stage), id_(id) {}
-        ~GLShaderModule() override;
-        ShaderStage getStage() const override { return stage_; }
-        unsigned int id_{0};
-    private:
-        ShaderStage stage_;
-    };
-
-    class GLBuffer final : public IBuffer {
-    public:
-        GLBuffer(size_t size, BufferUsage usage, unsigned int id) : size_(size), usage_(usage), id_(id) {}
-        ~GLBuffer() override;
-        size_t getSize() const override { return size_; }
-        BufferUsage getUsage() const override { return usage_; }
-        unsigned int id_{0};
-    private:
-        size_t size_{};
-        BufferUsage usage_{};
-    };
-
-    class GLGraphicsPipeline final : public IGraphicsPipeline {
-    public:
-        explicit GLGraphicsPipeline(unsigned int program, unsigned int vao) : program_(program), vao_(vao) {}
-        ~GLGraphicsPipeline() override;
-        unsigned int program_{0};
-        unsigned int vao_{0};
-    };
-
-    class GLDescriptorSet final : public IDescriptorSet {
-    public:
-        explicit GLDescriptorSet(const DescriptorSetDesc& d) : desc(d) {}
-        DescriptorSetDesc desc;
-    };
+    // Tipos específicos OpenGL movidos para headers dedicados
 
 public:
     std::unique_ptr<IShaderModule> createShaderModule(const ShaderModuleDesc& desc) override;
@@ -91,32 +43,57 @@ public:
     void setIndexBuffer(IBuffer* buffer) override;
     void bindDescriptorSet(IDescriptorSet* set) override;
     void draw(uint32_t vertexCount, uint32_t firstVertex) override;
-    void drawIndexed(uint32_t indexCount, uint32_t firstIndex) override;
+    void drawIndexed(uint32_t indexCount, uint32_t firstIndex, IndexType indexType) override;
     std::unique_ptr<ICommandList> createCommandList() override;
-    void submit(ICommandList* list) override { (void)list; /* immediate path: already executed */ }
+    void submit(ICommandList* list) override;
     Capabilities getCapabilities() const override { return caps_; }
 
-private:
+    // Textures/samplers
+    std::unique_ptr<ITexture> createTexture(const TextureDesc& desc, const void* initialPixelsRGBA8) override;
+    std::unique_ptr<ISampler> createSampler(const SamplerDesc& desc) override;
+    void setDebugWireframe(bool enable) override;
+
+    private:
     GLGraphicsPipeline* currentPipeline_{nullptr};
     GLBuffer* currentVertexBuffer_{nullptr};
     GLBuffer* currentIndexBuffer_{nullptr};
     Capabilities caps_{};
+    // Framebuffer atual quando usando attachments (criamos e destruímos por render pass, MVP)
+    unsigned int currentFBO_{0};
+    bool tempFBOCreated_{false};
+
+        // Caches simples para reduzir chamadas GL caras
+        // Cache: program -> (blockName -> blockIndex)
+        std::unordered_map<unsigned int, std::unordered_map<std::string, int>> programToUniformBlockIndexCache_{};
+        // Cache: program -> (uniformName -> location)
+        std::unordered_map<unsigned int, std::unordered_map<std::string, int>> programToUniformSamplerLocationCache_{};
+        // Último binding aplicado para (program, blockIndex) => binding
+        std::unordered_map<unsigned long long, unsigned int> uniformBlockBindingApplied_{};
+        // Último valor aplicado para (program, uniformLocation) => sampler unit
+        std::unordered_map<unsigned long long, int> samplerUniformApplied_{};
 
     class GLCommandList final : public ICommandList {
     public:
         explicit GLCommandList(GLDevice& dev) : device_(dev) {}
-        void begin() override {}
-        void end() override {}
-        void beginRenderPass(IRenderPass* renderPass, ISwapchain* target) override { device_.beginRenderPass(renderPass, target); }
-        void endRenderPass() override { device_.endRenderPass(); }
-        void setGraphicsPipeline(IGraphicsPipeline* pipeline) override { device_.setGraphicsPipeline(pipeline); }
-        void setVertexBuffer(IBuffer* buffer) override { device_.setVertexBuffer(buffer); }
-        void setIndexBuffer(IBuffer* buffer) override { device_.setIndexBuffer(buffer); }
-        void bindDescriptorSet(IDescriptorSet* /*set*/) override { /* TODO: bind UBOs via glBindBufferBase */ }
-        void draw(uint32_t vertexCount, uint32_t firstVertex) override { device_.draw(vertexCount, firstVertex); }
-        void drawIndexed(uint32_t indexCount, uint32_t firstIndex) override { device_.drawIndexed(indexCount, firstIndex); }
+        void begin() override { operations_.clear(); recording_ = true; }
+        void end() override { recording_ = false; }
+        void beginRenderPass(IRenderPass* renderPass, ISwapchain* target) override {
+            operations_.emplace_back([this, renderPass, target]{ device_.beginRenderPass(renderPass, target); });
+        }
+        void endRenderPass() override { operations_.emplace_back([this]{ device_.endRenderPass(); }); }
+        void setGraphicsPipeline(IGraphicsPipeline* pipeline) override { operations_.emplace_back([this, pipeline]{ device_.setGraphicsPipeline(pipeline); }); }
+        void setVertexBuffer(IBuffer* buffer) override { operations_.emplace_back([this, buffer]{ device_.setVertexBuffer(buffer); }); }
+        void setIndexBuffer(IBuffer* buffer) override { operations_.emplace_back([this, buffer]{ device_.setIndexBuffer(buffer); }); }
+        void bindDescriptorSet(IDescriptorSet* set) override { operations_.emplace_back([this, set]{ device_.bindDescriptorSet(set); }); }
+        void draw(uint32_t vertexCount, uint32_t firstVertex) override { operations_.emplace_back([this, vertexCount, firstVertex]{ device_.draw(vertexCount, firstVertex); }); }
+        void drawIndexed(uint32_t indexCount, uint32_t firstIndex, IndexType indexType) override { operations_.emplace_back([this, indexCount, firstIndex, indexType]{ device_.drawIndexed(indexCount, firstIndex, indexType); }); }
+        void setDebugWireframe(bool enable) override { operations_.emplace_back([this, enable]{ device_.setDebugWireframe(enable); }); }
     private:
         GLDevice& device_;
+        std::vector<std::function<void()>> operations_{};
+        bool recording_{false};
+
+        friend class GLDevice;
     };
 };
 

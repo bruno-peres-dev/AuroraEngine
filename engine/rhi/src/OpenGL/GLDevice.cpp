@@ -1,22 +1,35 @@
 #include "GLDevice.hpp"
 #include "Aurora/Core/Log.hpp"
+#include "GLState.hpp"
+#include "GLRenderPass.hpp"
+#include "GLSwapchain.hpp"
+#include "GLShaderModule.hpp"
+#include "GLBuffer.hpp"
+#include "GLGraphicsPipeline.hpp"
+#include "GLDescriptorSet.hpp"
+#include "GLTexture.hpp"
+#include "GLSampler.hpp"
+#include "GLCapabilities.hpp"
 
 #include <glad/glad.h>
 
 namespace Aurora::RHI {
 
-GLDevice::GLShaderModule::~GLShaderModule() {
-    if (id_) glDeleteShader(id_);
+#ifdef AURORA_DEBUG
+static void glCheckError(const char* where) {
+    GLenum err = glGetError();
+    if (err != 0) {
+        Core::log(Core::LogLevel::Error, std::string("GL error [") + where + "]: 0x" + std::to_string(static_cast<unsigned int>(err)));
+    }
 }
+#define GL_CHECK(where) glCheckError(where)
+#else
+#define GL_CHECK(where) ((void)0)
+#endif
 
-GLDevice::GLBuffer::~GLBuffer() {
-    if (id_) glDeleteBuffers(1, &id_);
-}
+using namespace Aurora::RHI::GLState;
 
-GLDevice::GLGraphicsPipeline::~GLGraphicsPipeline() {
-    if (vao_) glDeleteVertexArrays(1, &vao_);
-    if (program_) glDeleteProgram(program_);
-}
+// Destruidores das classes específicas agora residem em seus próprios arquivos
 
 std::unique_ptr<ISwapchain> GLDevice::createSwapchain(const SwapchainDesc& desc) {
     auto sc = std::make_unique<GLSwapchain>(desc.width, desc.height);
@@ -26,9 +39,10 @@ std::unique_ptr<ISwapchain> GLDevice::createSwapchain(const SwapchainDesc& desc)
         Core::log(Core::LogLevel::Error, "Falha ao inicializar contexto WGL");
         return nullptr;
     }
-    // Detect capabilities after context creation and glad load
-    caps_.supportsGLSL420 = GLAD_GL_VERSION_4_2 != 0;
-    caps_.hasShadingLanguage420Pack = false; // extensão não checada; versão já cobre o caminho 420
+    // Detect capabilities após criação de contexto e carregamento do glad
+    auto glcaps = GLCapabilities::query();
+    caps_.supportsGLSL420 = glcaps.supportsGLSL420;
+    caps_.hasShadingLanguage420Pack = glcaps.hasShadingLanguage420Pack;
 #endif
     return sc;
 }
@@ -61,11 +75,85 @@ void GLSwapchain::present() {
 #ifndef GL_FLOAT
 #define GL_FLOAT 0x1406
 #endif
+// FBO tokens (fallback para headers legados)
+#ifndef GL_FRAMEBUFFER
+#define GL_FRAMEBUFFER 0x8D40
+#endif
+#ifndef GL_COLOR_ATTACHMENT0
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#endif
+#ifndef GL_DEPTH_ATTACHMENT
+#define GL_DEPTH_ATTACHMENT 0x8D00
+#endif
+#ifndef GL_DEPTH_STENCIL_ATTACHMENT
+#define GL_DEPTH_STENCIL_ATTACHMENT 0x821A
+#endif
+#ifndef GL_FRAMEBUFFER_COMPLETE
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#endif
 
 void GLDevice::beginRenderPass(IRenderPass* renderPass, ISwapchain* target) {
-    (void)target;
     auto* rp = static_cast<GLRenderPass*>(renderPass);
-    glViewport(0, 0, static_cast<GLsizei>(target->getWidth()), static_cast<GLsizei>(target->getHeight()));
+
+    // Se attachments foram especificados, configuramos um FBO temporário (MVP)
+    bool useFBO = false;
+    unsigned int viewportW = target ? target->getWidth() : 0;
+    unsigned int viewportH = target ? target->getHeight() : 0;
+
+    if (!rp->desc_.colorAttachments.empty() || rp->desc_.depthAttachment.texture) {
+        glGenFramebuffers(1, &currentFBO_);
+        glBindFramebuffer(GL_FRAMEBUFFER, currentFBO_);
+        tempFBOCreated_ = true;
+        useFBO = true;
+
+        // Attach colors
+        std::vector<unsigned int> drawBuffers;
+        drawBuffers.reserve(rp->desc_.colorAttachments.size());
+        for (size_t i = 0; i < rp->desc_.colorAttachments.size(); ++i) {
+            const auto& a = rp->desc_.colorAttachments[i];
+            if (!a.texture) continue;
+            auto* gltex = static_cast<GLTexture*>(a.texture);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, static_cast<unsigned int>(GL_COLOR_ATTACHMENT0 + i), 0x0DE1 /*GL_TEXTURE_2D*/, gltex->id_, static_cast<int>(a.mipLevel));
+            drawBuffers.push_back(static_cast<unsigned int>(GL_COLOR_ATTACHMENT0 + i));
+            if (viewportW == 0 || viewportH == 0) {
+                auto td = gltex->getDesc();
+                viewportW = td.width >> a.mipLevel; if (viewportW == 0) viewportW = 1;
+                viewportH = td.height >> a.mipLevel; if (viewportH == 0) viewportH = 1;
+            }
+        }
+        if (!drawBuffers.empty()) {
+            glDrawBuffers(static_cast<int>(drawBuffers.size()), reinterpret_cast<const unsigned int*>(drawBuffers.data()));
+        } else {
+            // depth-only: desabilita draw buffers
+            glDrawBuffer(0);
+        }
+
+        // Attach depth
+        if (rp->desc_.depthAttachment.texture) {
+            auto* gltex = static_cast<GLTexture*>(rp->desc_.depthAttachment.texture);
+            auto td = gltex->getDesc();
+            unsigned int attachment = (td.format == TextureFormat::Depth24Stencil8) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+            glFramebufferTexture2D(GL_FRAMEBUFFER, attachment, 0x0DE1 /*GL_TEXTURE_2D*/, gltex->id_, static_cast<int>(rp->desc_.depthAttachment.mipLevel));
+            if (viewportW == 0 || viewportH == 0) {
+                viewportW = td.width >> rp->desc_.depthAttachment.mipLevel; if (viewportW == 0) viewportW = 1;
+                viewportH = td.height >> rp->desc_.depthAttachment.mipLevel; if (viewportH == 0) viewportH = 1;
+            }
+        }
+
+        unsigned int status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            Core::log(Core::LogLevel::Error, "FBO incompleto");
+        }
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    // Viewport
+    if (viewportW == 0 || viewportH == 0) {
+        viewportW = target ? target->getWidth() : 0;
+        viewportH = target ? target->getHeight() : 0;
+    }
+    glViewport(0, 0, static_cast<GLsizei>(viewportW), static_cast<GLsizei>(viewportH));
     if (rp->desc_.clearColorEnabled || rp->desc_.clearDepthEnabled) {
         GLbitfield mask = 0;
         if (rp->desc_.clearColorEnabled) {
@@ -83,7 +171,12 @@ void GLDevice::beginRenderPass(IRenderPass* renderPass, ISwapchain* target) {
 }
 
 void GLDevice::endRenderPass() {
-    // Nothing for now
+    if (tempFBOCreated_) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1, &currentFBO_);
+        currentFBO_ = 0;
+        tempFBOCreated_ = false;
+    }
 }
 
 // Simple triangle validation on first frame could be added later
@@ -135,36 +228,28 @@ std::unique_ptr<IGraphicsPipeline> GLDevice::createGraphicsPipeline(const Graphi
         glVertexAttribPointer(a.location, a.components, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(desc.vertexLayout.stride), reinterpret_cast<const void*>(static_cast<uintptr_t>(a.offset)));
         glEnableVertexAttribArray(a.location);
     }
-    // Raster/state
-    if (desc.state.raster.depthTestEnable) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    glDepthMask(desc.state.raster.depthWriteEnable ? GL_TRUE : GL_FALSE);
-    switch (desc.state.raster.depthFunc) {
-        case DepthFunc::Less: glDepthFunc(GL_LESS); break;
-        case DepthFunc::LessEqual: glDepthFunc(GL_LEQUAL); break;
-        case DepthFunc::Greater: glDepthFunc(GL_GREATER); break;
-        case DepthFunc::GreaterEqual: glDepthFunc(GL_GEQUAL); break;
-        case DepthFunc::Equal: glDepthFunc(GL_EQUAL); break;
-        case DepthFunc::NotEqual: glDepthFunc(GL_NOTEQUAL); break;
-        case DepthFunc::Always: glDepthFunc(GL_ALWAYS); break;
-        case DepthFunc::Never: default: glDepthFunc(GL_NEVER); break;
-    }
-    if (desc.state.raster.cullMode == CullMode::None) glDisable(GL_CULL_FACE); else glEnable(GL_CULL_FACE);
-    if (desc.state.raster.cullMode == CullMode::Back) glCullFace(GL_BACK); else if (desc.state.raster.cullMode == CullMode::Front) glCullFace(GL_FRONT);
-    glFrontFace(desc.state.raster.frontFaceCCW ? GL_CCW : GL_CW);
-    if (desc.state.raster.blendEnable) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); } else { glDisable(GL_BLEND); }
-    return std::make_unique<GLGraphicsPipeline>(program, vao);
+    return std::make_unique<GLGraphicsPipeline>(program, vao, desc.vertexLayout, desc.state);
 }
 
 void GLDevice::setGraphicsPipeline(IGraphicsPipeline* pipeline) {
     currentPipeline_ = static_cast<GLGraphicsPipeline*>(pipeline);
     glUseProgram(currentPipeline_->program_);
     glBindVertexArray(currentPipeline_->vao_);
+    // Aplicar estado de raster/blend/depth do pipeline atual
+    applyPipelineState(currentPipeline_->state_);
 }
 
 void GLDevice::setVertexBuffer(IBuffer* buffer) {
     auto* glb = static_cast<GLBuffer*>(buffer);
     glBindBuffer(GL_ARRAY_BUFFER, glb->id_);
     currentVertexBuffer_ = glb;
+    // Re-aplicar ponteiros de atributo para garantir estado correto com este VBO
+    if (currentPipeline_) {
+        for (const auto& a : currentPipeline_->layout_.attributes) {
+            glVertexAttribPointer(a.location, a.components, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(currentPipeline_->layout_.stride), reinterpret_cast<const void*>(static_cast<uintptr_t>(a.offset)));
+            glEnableVertexAttribArray(a.location);
+        }
+    }
 }
 
 void GLDevice::draw(uint32_t vertexCount, uint32_t firstVertex) {
@@ -182,11 +267,10 @@ void GLDevice::setIndexBuffer(IBuffer* buffer) {
     glBindBuffer(0x8893 /*GL_ELEMENT_ARRAY_BUFFER*/, glb->id_);
 }
 
-void GLDevice::drawIndexed(uint32_t indexCount, uint32_t firstIndex) {
+void GLDevice::drawIndexed(uint32_t indexCount, uint32_t firstIndex, IndexType indexType) {
     (void)firstIndex; // not supporting offset for now
-    // glDrawElements with unsigned int indices is sufficient for sample
-    typedef void (APIENTRYP PFNGLDRAWELEMENTSPROC)(GLenum, GLsizei, GLenum, const void*);
-    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(indexCount), 0x1405 /*GL_UNSIGNED_INT*/, nullptr);
+    GLenum glType = (indexType == IndexType::Uint16) ? 0x1403 /*GL_UNSIGNED_SHORT*/ : 0x1405 /*GL_UNSIGNED_INT*/;
+    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(indexCount), glType, nullptr);
 }
 
 void GLDevice::bindDescriptorSet(IDescriptorSet* set) {
@@ -197,12 +281,53 @@ void GLDevice::bindDescriptorSet(IDescriptorSet* set) {
         GLuint program = currentPipeline_ ? currentPipeline_->program_ : 0;
         if (program) {
             const char* blockName = ub.blockName ? ub.blockName : "Globals";
-            GLint blockIndex = glGetUniformBlockIndex(program, blockName);
+            // Cache lookup para blockIndex
+            GLint blockIndex = -1;
+            auto& blockMap = programToUniformBlockIndexCache_[program];
+            auto itBlock = blockMap.find(blockName);
+            if (itBlock != blockMap.end()) {
+                blockIndex = itBlock->second;
+            } else {
+                blockIndex = glGetUniformBlockIndex(program, blockName);
+                blockMap[blockName] = blockIndex;
+            }
             if (blockIndex >= 0) {
-                glUniformBlockBinding(program, static_cast<GLuint>(blockIndex), ub.binding);
+                unsigned long long key = (static_cast<unsigned long long>(program) << 32) | static_cast<unsigned long long>(blockIndex);
+                auto itApplied = uniformBlockBindingApplied_.find(key);
+                if (itApplied == uniformBlockBindingApplied_.end() || itApplied->second != ub.binding) {
+                    glUniformBlockBinding(program, static_cast<GLuint>(blockIndex), ub.binding);
+                    uniformBlockBindingApplied_[key] = ub.binding;
+                }
             }
         }
         glBindBufferBase(0x8A11 /*GL_UNIFORM_BUFFER*/, ub.binding, buf->id_);
+    }
+
+    // Bind sampled textures
+    for (const auto& st : glset->desc.sampledTextures) {
+        auto* tex = static_cast<GLTexture*>(st.texture);
+        auto* smp = static_cast<GLSampler*>(st.sampler);
+        if (!tex || !smp) continue;
+        // Resolve uniform sampler location if a name is provided
+        if (currentPipeline_ && st.uniformName) {
+            unsigned int program = currentPipeline_->program_;
+            auto& locMap = programToUniformSamplerLocationCache_[program];
+            int loc = -1;
+            auto itLoc = locMap.find(st.uniformName);
+            if (itLoc != locMap.end()) loc = itLoc->second; else { loc = glGetUniformLocation(program, st.uniformName); locMap[st.uniformName] = loc; }
+            if (loc >= 0) {
+                unsigned long long key = (static_cast<unsigned long long>(program) << 32) | static_cast<unsigned long long>(loc);
+                auto itSet = samplerUniformApplied_.find(key);
+                if (itSet == samplerUniformApplied_.end() || itSet->second != static_cast<int>(st.binding)) {
+                    glUniform1i(loc, static_cast<int>(st.binding));
+                    samplerUniformApplied_[key] = static_cast<int>(st.binding);
+                }
+            }
+        }
+        // Activate texture unit == binding, bind texture and sampler
+        glActiveTexture(0x84C0 /*GL_TEXTURE0*/ + st.binding);
+        glBindTexture(0x0DE1 /*GL_TEXTURE_2D*/, tex->id_);
+        glBindSampler(st.binding, smp->id_);
     }
 }
 
@@ -217,6 +342,73 @@ void GLDevice::updateBuffer(IBuffer* buffer, const void* data, size_t bytes, siz
 
 std::unique_ptr<ICommandList> GLDevice::createCommandList() {
     return std::make_unique<GLCommandList>(*this);
+}
+
+void GLDevice::submit(ICommandList* list) {
+    auto* gl = static_cast<GLCommandList*>(list);
+    for (auto& op : gl->operations_) op();
+}
+
+std::unique_ptr<ITexture> GLDevice::createTexture(const TextureDesc& desc, const void* initialPixelsRGBA8) {
+    unsigned int id = 0;
+    glGenTextures(1, &id);
+    glBindTexture(0x0DE1 /*GL_TEXTURE_2D*/, id);
+    // Set basic params
+    glTexParameteri(0x0DE1, 0x2801 /*GL_TEXTURE_MIN_FILTER*/, 0x2601 /*GL_LINEAR*/);
+    glTexParameteri(0x0DE1, 0x2800 /*GL_TEXTURE_MAG_FILTER*/, 0x2601 /*GL_LINEAR*/);
+    glTexParameteri(0x0DE1, 0x2802 /*GL_TEXTURE_WRAP_S*/, 0x2901 /*GL_CLAMP_TO_EDGE*/);
+    glTexParameteri(0x0DE1, 0x2803 /*GL_TEXTURE_WRAP_T*/, 0x2901 /*GL_CLAMP_TO_EDGE*/);
+    // Upload com alinhamento
+    glPixelStorei(0x0CF5 /*GL_UNPACK_ALIGNMENT*/, 1);
+    int internal = 0x8058 /*GL_RGBA8*/;
+    int format = 0x1908 /*GL_RGBA*/;
+    int type = 0x1401 /*GL_UNSIGNED_BYTE*/;
+    glTexImage2D(0x0DE1, 0, internal, static_cast<int>(desc.width), static_cast<int>(desc.height), 0, format, type, initialPixelsRGBA8);
+    // Mipmaps, se solicitado
+    if (desc.mipLevels > 1) {
+        glGenerateMipmap(0x0DE1);
+    }
+    return std::make_unique<GLTexture>(desc, id);
+}
+
+std::unique_ptr<ISampler> GLDevice::createSampler(const SamplerDesc& desc) {
+    unsigned int id = 0; glGenSamplers(1, &id);
+    int minf = (desc.minFilter == FilterMode::Linear) ? 0x2601 /*GL_LINEAR*/ : 0x2600 /*GL_NEAREST*/;
+    int magf = (desc.magFilter == FilterMode::Linear) ? 0x2601 /*GL_LINEAR*/ : 0x2600 /*GL_NEAREST*/;
+    int wrapU = (desc.addressU == AddressMode::Repeat) ? 0x2901 /*GL_REPEAT*/ : 0x812F /*GL_CLAMP_TO_EDGE*/;
+    int wrapV = (desc.addressV == AddressMode::Repeat) ? 0x2901 /*GL_REPEAT*/ : 0x812F /*GL_CLAMP_TO_EDGE*/;
+    // Mipmap mode
+    int minFilterWithMips = minf;
+    if (desc.mipmapMode == SamplerDesc::MipmapMode::Nearest) {
+        minFilterWithMips = (minf == 0x2601 /*GL_LINEAR*/) ? 0x2701 /*GL_LINEAR_MIPMAP_NEAREST*/ : 0x2700 /*GL_NEAREST_MIPMAP_NEAREST*/;
+    } else if (desc.mipmapMode == SamplerDesc::MipmapMode::Linear) {
+        minFilterWithMips = (minf == 0x2601 /*GL_LINEAR*/) ? 0x2703 /*GL_LINEAR_MIPMAP_LINEAR*/ : 0x2702 /*GL_NEAREST_MIPMAP_LINEAR*/;
+    }
+    glSamplerParameteri(id, 0x2801 /*GL_TEXTURE_MIN_FILTER*/, minFilterWithMips);
+    glSamplerParameteri(id, 0x2800 /*GL_TEXTURE_MAG_FILTER*/, magf);
+    glSamplerParameteri(id, 0x2802 /*GL_TEXTURE_WRAP_S*/, wrapU);
+    glSamplerParameteri(id, 0x2803 /*GL_TEXTURE_WRAP_T*/, wrapV);
+    return std::make_unique<GLSampler>(id);
+}
+
+void GLDevice::setDebugWireframe(bool enable) {
+    // Algumas implementações core profile desabilitam polygon mode por face
+    // Consulta o profile mask uma única vez
+    #ifndef GL_CONTEXT_PROFILE_MASK
+    #define GL_CONTEXT_PROFILE_MASK 0x9126
+    #endif
+    #ifndef GL_CONTEXT_COMPATIBILITY_PROFILE_BIT
+    #define GL_CONTEXT_COMPATIBILITY_PROFILE_BIT 0x00000002
+    #endif
+    static int s_profileMask = -1;
+    if (s_profileMask == -1) {
+        glGetIntegerv(GL_CONTEXT_PROFILE_MASK, &s_profileMask);
+    }
+    if (s_profileMask & GL_CONTEXT_COMPATIBILITY_PROFILE_BIT) {
+        glPolygonMode(0x0404 /*GL_FRONT_AND_BACK*/, enable ? 0x1B01 /*GL_LINE*/ : 0x1B02 /*GL_FILL*/);
+    } else {
+        Core::log(Core::LogLevel::Warn, "Wireframe indisponível no Core Profile; ignorando toggle");
+    }
 }
 
 

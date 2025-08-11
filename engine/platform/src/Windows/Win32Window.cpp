@@ -8,6 +8,40 @@ namespace Aurora::Platform {
 
 static const wchar_t* kWindowClassName = L"AuroraWin32Window";
 
+static Key mapVkToKey(WPARAM vk, LPARAM /*lparam*/) {
+    switch (vk) {
+        // Letters
+        case 'A': return Key::A; case 'B': return Key::B; case 'C': return Key::C; case 'D': return Key::D;
+        case 'E': return Key::E; case 'F': return Key::F; case 'G': return Key::G; case 'H': return Key::H;
+        case 'I': return Key::I; case 'J': return Key::J; case 'K': return Key::K; case 'L': return Key::L;
+        case 'M': return Key::M; case 'N': return Key::N; case 'O': return Key::O; case 'P': return Key::P;
+        case 'Q': return Key::Q; case 'R': return Key::R; case 'S': return Key::S; case 'T': return Key::T;
+        case 'U': return Key::U; case 'V': return Key::V; case 'W': return Key::W; case 'X': return Key::X;
+        case 'Y': return Key::Y; case 'Z': return Key::Z;
+        // Numbers
+        case '0': return Key::Num0; case '1': return Key::Num1; case '2': return Key::Num2; case '3': return Key::Num3;
+        case '4': return Key::Num4; case '5': return Key::Num5; case '6': return Key::Num6; case '7': return Key::Num7;
+        case '8': return Key::Num8; case '9': return Key::Num9;
+        // Controls
+        case VK_ESCAPE: return Key::Escape;
+        case VK_SPACE: return Key::Space;
+        case VK_RETURN: return Key::Enter;
+        case VK_TAB: return Key::Tab;
+        case VK_LSHIFT: return Key::ShiftLeft;
+        case VK_RSHIFT: return Key::ShiftRight;
+        case VK_LCONTROL: return Key::ControlLeft;
+        case VK_RCONTROL: return Key::ControlRight;
+        case VK_LMENU: return Key::AltLeft;
+        case VK_RMENU: return Key::AltRight;
+        // Arrows
+        case VK_UP: return Key::ArrowUp;
+        case VK_DOWN: return Key::ArrowDown;
+        case VK_LEFT: return Key::ArrowLeft;
+        case VK_RIGHT: return Key::ArrowRight;
+        default: return Key::Unknown;
+    }
+}
+
 static ATOM ensureWindowClass(HINSTANCE hinst) {
     static ATOM atom = 0;
     if (atom) return atom;
@@ -82,6 +116,10 @@ LRESULT CALLBACK Win32Window::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
     auto* that = reinterpret_cast<Win32Window*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     switch (msg) {
         case WM_CLOSE:
+            if (that) {
+                Event e{}; e.type = EventType::WindowClose; that->events_.push_back(e);
+                that->running_ = false;
+            }
             PostQuitMessage(0);
             return 0;
         case WM_SIZE: {
@@ -145,7 +183,8 @@ LRESULT CALLBACK Win32Window::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
                 size_t idx = vk & 0xFFu;
                 if (!that->input_.keyDown.test(idx)) that->input_.keyPressed.set(idx);
                 that->input_.keyDown.set(idx);
-                Event e{}; e.type = EventType::KeyDown; e.key = Key::Unknown; that->events_.push_back(e);
+                Event e{}; e.type = EventType::KeyDown; e.key = mapVkToKey(wparam, lparam); that->events_.push_back(e);
+                if (vk == VK_ESCAPE) { that->running_ = false; }
             }
             return 0;
         }
@@ -155,7 +194,7 @@ LRESULT CALLBACK Win32Window::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
                 size_t idx = vk & 0xFFu;
                 that->input_.keyDown.reset(idx);
                 that->input_.keyReleased.set(idx);
-                Event e{}; e.type = EventType::KeyUp; e.key = Key::Unknown; that->events_.push_back(e);
+                Event e{}; e.type = EventType::KeyUp; e.key = mapVkToKey(wparam, lparam); that->events_.push_back(e);
             }
             return 0;
         }
