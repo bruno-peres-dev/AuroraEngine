@@ -154,6 +154,9 @@ void GLDevice::beginRenderPass(IRenderPass* renderPass, ISwapchain* target) {
         viewportH = target ? target->getHeight() : 0;
     }
     glViewport(0, 0, static_cast<GLsizei>(viewportW), static_cast<GLsizei>(viewportH));
+    // Sempre garantir estado de limpeza consistente: habilita teste de depth e mascara
+    glEnable(0x0B71 /*GL_DEPTH_TEST*/);
+    glDepthMask(1);
     if (rp->desc_.clearColorEnabled || rp->desc_.clearDepthEnabled) {
         GLbitfield mask = 0;
         if (rp->desc_.clearColorEnabled) {
@@ -350,23 +353,90 @@ void GLDevice::submit(ICommandList* list) {
 }
 
 std::unique_ptr<ITexture> GLDevice::createTexture(const TextureDesc& desc, const void* initialPixelsRGBA8) {
+    // Define tokens ausentes caso necessário
+    #ifndef GL_TEXTURE_2D
+    #define GL_TEXTURE_2D 0x0DE1
+    #endif
+    #ifndef GL_UNPACK_ALIGNMENT
+    #define GL_UNPACK_ALIGNMENT 0x0CF5
+    #endif
+    #ifndef GL_RGBA8
+    #define GL_RGBA8 0x8058
+    #endif
+    #ifndef GL_RGB8
+    #define GL_RGB8 0x8051
+    #endif
+    #ifndef GL_R8
+    #define GL_R8 0x8229
+    #endif
+    #ifndef GL_RGBA16F
+    #define GL_RGBA16F 0x881A
+    #endif
+    #ifndef GL_R16F
+    #define GL_R16F 0x822D
+    #endif
+    #ifndef GL_DEPTH24_STENCIL8
+    #define GL_DEPTH24_STENCIL8 0x88F0
+    #endif
+    #ifndef GL_DEPTH_COMPONENT32F
+    #define GL_DEPTH_COMPONENT32F 0x8CAC
+    #endif
+    #ifndef GL_DEPTH_STENCIL
+    #define GL_DEPTH_STENCIL 0x84F9
+    #endif
+    #ifndef GL_UNSIGNED_INT_24_8
+    #define GL_UNSIGNED_INT_24_8 0x84FA
+    #endif
+    #ifndef GL_DEPTH_COMPONENT
+    #define GL_DEPTH_COMPONENT 0x1902
+    #endif
+    #ifndef GL_HALF_FLOAT
+    #define GL_HALF_FLOAT 0x140B
+    #endif
+    #ifndef GL_LINEAR
+    #define GL_LINEAR 0x2601
+    #endif
+    #ifndef GL_NEAREST
+    #define GL_NEAREST 0x2600
+    #endif
+    #ifndef GL_CLAMP_TO_EDGE
+    #define GL_CLAMP_TO_EDGE 0x812F
+    #endif
+
     unsigned int id = 0;
     glGenTextures(1, &id);
-    glBindTexture(0x0DE1 /*GL_TEXTURE_2D*/, id);
-    // Set basic params
-    glTexParameteri(0x0DE1, 0x2801 /*GL_TEXTURE_MIN_FILTER*/, 0x2601 /*GL_LINEAR*/);
-    glTexParameteri(0x0DE1, 0x2800 /*GL_TEXTURE_MAG_FILTER*/, 0x2601 /*GL_LINEAR*/);
-    glTexParameteri(0x0DE1, 0x2802 /*GL_TEXTURE_WRAP_S*/, 0x2901 /*GL_CLAMP_TO_EDGE*/);
-    glTexParameteri(0x0DE1, 0x2803 /*GL_TEXTURE_WRAP_T*/, 0x2901 /*GL_CLAMP_TO_EDGE*/);
-    // Upload com alinhamento
-    glPixelStorei(0x0CF5 /*GL_UNPACK_ALIGNMENT*/, 1);
-    int internal = 0x8058 /*GL_RGBA8*/;
+    glBindTexture(GL_TEXTURE_2D, id);
+    // Parametrização padrão
+    glTexParameteri(GL_TEXTURE_2D, 0x2801 /*GL_TEXTURE_MIN_FILTER*/, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, 0x2800 /*GL_TEXTURE_MAG_FILTER*/, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, 0x2802 /*GL_TEXTURE_WRAP_S*/, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, 0x2803 /*GL_TEXTURE_WRAP_T*/, GL_CLAMP_TO_EDGE);
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    int internal = GL_RGBA8;
     int format = 0x1908 /*GL_RGBA*/;
     int type = 0x1401 /*GL_UNSIGNED_BYTE*/;
-    glTexImage2D(0x0DE1, 0, internal, static_cast<int>(desc.width), static_cast<int>(desc.height), 0, format, type, initialPixelsRGBA8);
-    // Mipmaps, se solicitado
-    if (desc.mipLevels > 1) {
-        glGenerateMipmap(0x0DE1);
+
+    switch (desc.format) {
+        case TextureFormat::RGBA8: internal = GL_RGBA8; format = 0x1908 /*GL_RGBA*/; type = 0x1401 /*GL_UNSIGNED_BYTE*/; break;
+        case TextureFormat::RGB8: internal = GL_RGB8; format = 0x1907 /*GL_RGB*/; type = 0x1401 /*GL_UNSIGNED_BYTE*/; break;
+        case TextureFormat::R8: internal = GL_R8; format = 0x1903 /*GL_RED*/; type = 0x1401 /*GL_UNSIGNED_BYTE*/; break;
+        case TextureFormat::RGBA16F: internal = GL_RGBA16F; format = 0x1908 /*GL_RGBA*/; type = GL_HALF_FLOAT; break;
+        case TextureFormat::R16F: internal = GL_R16F; format = 0x1903 /*GL_RED*/; type = GL_HALF_FLOAT; break;
+        case TextureFormat::Depth24Stencil8: internal = GL_DEPTH24_STENCIL8; format = GL_DEPTH_STENCIL; type = GL_UNSIGNED_INT_24_8; break;
+        case TextureFormat::Depth32F: internal = GL_DEPTH_COMPONENT32F; format = GL_DEPTH_COMPONENT; type = 0x1406 /*GL_FLOAT*/; break;
+        default: break;
+    }
+
+    const void* data = initialPixelsRGBA8;
+    if (desc.format == TextureFormat::Depth24Stencil8 || desc.format == TextureFormat::Depth32F) {
+        data = nullptr; // sem upload inicial para depth
+    }
+
+    glTexImage2D(GL_TEXTURE_2D, 0, internal, static_cast<int>(desc.width), static_cast<int>(desc.height), 0, format, type, data);
+    if (desc.mipLevels > 1 && (desc.format == TextureFormat::RGBA8 || desc.format == TextureFormat::RGB8 || desc.format == TextureFormat::R8 || desc.format == TextureFormat::RGBA16F || desc.format == TextureFormat::R16F)) {
+        glGenerateMipmap(GL_TEXTURE_2D);
     }
     return std::make_unique<GLTexture>(desc, id);
 }

@@ -29,6 +29,12 @@ public:
 IWindow* createWindow(const WindowDesc& desc);
 void destroyWindow(IWindow* window);
 
+#ifdef _WIN32
+// Hook opcional para encaminhar mensagens Win32 (útil para Dear ImGui)
+using Win32MsgHook = bool(*)(void* hwnd, unsigned int msg, unsigned long long wparam, long long lparam);
+void setWin32WndProcHook(Win32MsgHook hook);
+#endif
+
 }
 
 

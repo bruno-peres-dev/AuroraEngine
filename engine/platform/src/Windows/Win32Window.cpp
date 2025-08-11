@@ -8,6 +8,12 @@ namespace Aurora::Platform {
 
 static const wchar_t* kWindowClassName = L"AuroraWin32Window";
 
+static Win32MsgHook g_win32Hook = nullptr;
+
+void setWin32WndProcHook(Win32MsgHook hook) {
+    g_win32Hook = hook;
+}
+
 static Key mapVkToKey(WPARAM vk, LPARAM /*lparam*/) {
     switch (vk) {
         // Letters
@@ -107,6 +113,11 @@ void Win32Window::getSize(uint32_t& outWidth, uint32_t& outHeight) const {
 }
 
 LRESULT CALLBACK Win32Window::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (g_win32Hook) {
+        if (g_win32Hook(reinterpret_cast<void*>(hwnd), static_cast<unsigned int>(msg), static_cast<unsigned long long>(wparam), static_cast<long long>(lparam))) {
+            return 1; // mensagem consumida
+        }
+    }
     if (msg == WM_NCCREATE) {
         auto cs = reinterpret_cast<CREATESTRUCTW*>(lparam);
         auto* that = static_cast<Win32Window*>(cs->lpCreateParams);

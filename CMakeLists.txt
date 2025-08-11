@@ -27,4 +27,8 @@ endif()
 add_subdirectory(engine)
 add_subdirectory(apps/Runtime)
 
+if(AURORA_BUILD_EDITOR)
+  add_subdirectory(apps/Editor)
+endif()
+
 
